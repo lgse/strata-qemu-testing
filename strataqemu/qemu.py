@@ -59,6 +59,7 @@ def build_qemu_argv(
     cidata_iso: Path | str | None = None,
     install_iso: Path | str | None = None,
     qemu_binary: str = QEMU_BINARY,
+    hotplug_port: bool = False,
 ) -> list[str]:
     """Frozen test/image-build argv (and graphical / UEFI / cidata variants).
 
@@ -141,6 +142,13 @@ def build_qemu_argv(
             "usb-tablet",
         ]
     )
+    if hotplug_port:
+        argv.extend(
+            [
+                "-device",
+                f"pcie-root-port,id={LUKS_HOTPLUG_BUS},slot=1,chassis=1",
+            ]
+        )
     if ovmf_code is not None and ovmf_vars is not None:
         argv.extend(
             [
@@ -470,6 +478,117 @@ def qmp_system_powerdown(socket_path: Path | str, *, timeout: float = 5.0) -> bo
         return False
     if "error" in reply:
         log.debug("qmp system_powerdown error: %s", reply["error"])
+        return False
+    return True
+
+
+LUKS_IMAGE_SIZE_MIB = 16
+LUKS_IMAGE_PASSPHRASE = "foobar"
+LUKS_HOTPLUG_NODE = "luks0"
+LUKS_HOTPLUG_DEVICE_ID = "luksdsk"
+LUKS_HOTPLUG_SERIAL = "strata-luks"
+LUKS_HOTPLUG_BUS = "hotplug0"
+LUKS_IMAGE_TOOLS_MISSING = (
+    "run-test: --luks-hotplug requires qemu-img and cryptsetup on the host"
+)
+LUKS_HOTPLUG_QMP_FAILED = "run-test: QMP LUKS hotplug failed"
+
+
+def create_luks_image(
+    dest: Path | str,
+    *,
+    size_mib: int = LUKS_IMAGE_SIZE_MIB,
+    passphrase: str = LUKS_IMAGE_PASSPHRASE,
+    run: Callable[..., subprocess.CompletedProcess] | None = None,
+) -> Path:
+    """Write a raw LUKS1 container. Does not unlock it on the host."""
+    path = Path(dest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    runner = run or subprocess.run
+    try:
+        create = runner(
+            [
+                "qemu-img",
+                "create",
+                "-f",
+                "raw",
+                str(path),
+                f"{int(size_mib)}M",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(LUKS_IMAGE_TOOLS_MISSING) from exc
+    if create.returncode != 0:
+        err = (create.stderr or create.stdout or "").strip()
+        raise RuntimeError(err or "qemu-img create failed")
+    try:
+        fmt = runner(
+            [
+                "cryptsetup",
+                "luksFormat",
+                "--batch-mode",
+                "--type",
+                "luks1",
+                "--key-file",
+                "-",
+                str(path),
+            ],
+            input=passphrase,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(LUKS_IMAGE_TOOLS_MISSING) from exc
+    if fmt.returncode != 0:
+        err = (fmt.stderr or fmt.stdout or "").strip()
+        raise RuntimeError(err or "cryptsetup luksFormat failed")
+    return path
+
+
+def qmp_hotplug_raw_disk(
+    socket_path: Path | str,
+    image: Path | str,
+    *,
+    node_name: str = LUKS_HOTPLUG_NODE,
+    device_id: str = LUKS_HOTPLUG_DEVICE_ID,
+    serial: str = LUKS_HOTPLUG_SERIAL,
+    timeout: float = 5.0,
+    execute: Callable[..., dict | None] | None = None,
+) -> bool:
+    """Hotplug ``image`` as virtio-blk. Two QMP commands; False on error."""
+    filename = str(Path(image).resolve())
+    runner = execute or _qmp_execute
+    added = runner(
+        socket_path,
+        "blockdev-add",
+        {
+            "node-name": node_name,
+            "driver": "raw",
+            "file": {"driver": "file", "filename": filename},
+        },
+        timeout=timeout,
+    )
+    if added is None or "error" in added:
+        log.debug("qmp blockdev-add failed: %s", added)
+        return False
+    attached = runner(
+        socket_path,
+        "device_add",
+        {
+            "driver": "virtio-blk-pci",
+            "id": device_id,
+            "drive": node_name,
+            "serial": serial,
+            "bus": LUKS_HOTPLUG_BUS,
+        },
+        timeout=timeout,
+    )
+    if attached is None or "error" in attached:
+        log.debug("qmp device_add failed: %s", attached)
         return False
     return True
 

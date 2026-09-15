@@ -34,6 +34,9 @@ from strataqemu.tests_spec import (
     OMARCHY_BINDINGS_EXCLUSIVE,
     OMARCHY_BINDINGS_FAIL_CLOSED,
     OMARCHY_BINDINGS_STEPS,
+    UDISKIE_UNLOCK_EXCLUSIVE,
+    UDISKIE_UNLOCK_FAIL_CLOSED,
+    UDISKIE_UNLOCK_STEPS,
     UPDATE_FROM_EXCLUSIVE,
     UPDATE_FROM_STEPS,
     missing_golden_message,
@@ -141,6 +144,60 @@ class _FakeRun:
                 f"BINDINGS_KIND={kind}\nBINDINGS_PATH=/home/tester/.config/hypr/bindings.{kind}\n",
                 "",
             )
+        if "smoke-luks-hotplug.sh" in remote:
+            if "SMOKE_LUKS_CASE=wrap" in remote:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    "WRAPPED=1\nHOOK_LOG=/tmp/strata-luks-hook.log\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "STRATA_CALLED=1\n"
+                "LUKS_DEV=vdc\n"
+                "LUKS_SERIAL=strata-luks\n"
+                "HOOK_LINE=--udiskie-hook device_added crypto /dev/vdc uuid\n",
+                "",
+            )
+        if "udiskie/config.yml" in remote:
+            return subprocess.CompletedProcess(argv, 0, "HOOK_CONFIG=1\n", "")
+        if "pacman -S --needed --noconfirm udiskie" in remote and "gtk4" not in remote:
+            return subprocess.CompletedProcess(argv, 0, "UDISKIE=ok\n", "")
+        if "printf 'UDISKIE=" in remote:
+            return subprocess.CompletedProcess(argv, 0, "UDISKIE=ok\n", "")
+        if "smoke-udiskie-unlock.sh" in remote:
+            if "SMOKE_UDISKIE_CASE=parse-args" in remote:
+                with_flag = (
+                    "yes" if "--with-udiskie-unlock" in remote else "ask"
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    "NON_INTERACTIVE=yes\n"
+                    f"WITH_UDISKIE_UNLOCK={with_flag}\n"
+                    "BIN_CALLS=0\n",
+                    "",
+                )
+            calls = "0"
+            on_path = "1" if "SMOKE_UDISKIE_STUB=1" in remote else "0"
+            if (
+                "SMOKE_PROMPT=yes" in remote
+                and "SMOKE_UDISKIE_STUB=1" in remote
+                and "SMOKE_MARKER=1" in remote
+            ):
+                calls = "1"
+            body = (
+                f"BIN_CALLS={calls}\n"
+                f"UDISKIE_ON_PATH={on_path}\n"
+                "RELEASE_SUPPORTS=1\n"
+                "UDISKIE_RAN=0\n"
+                "DECOY_CALLS=0\n"
+            )
+            if calls == "1":
+                body += "BIN_ARGV=--install-udiskie-unlock\n"
+            return subprocess.CompletedProcess(argv, 0, body, "")
         if "smoke-about.sh" in remote:
             return subprocess.CompletedProcess(argv, 0, "INPUT=wtype\n", "")
         if "smoke-update.sh" in remote:
@@ -661,6 +718,8 @@ class HelpAndMiseTests(unittest.TestCase):
         self.assertIn("local-archive", text)
         self.assertIn("--omarchy-bindings", text)
         self.assertIn("--update-from", text)
+        self.assertIn("--udiskie-unlock", text)
+        self.assertIn("--luks-hotplug", text)
         self.assertNotIn("not implemented", text)
 
     def test_vm_run_help_has_graphical(self) -> None:
@@ -1154,6 +1213,191 @@ class ArchInstallFromTests(unittest.TestCase):
             self.assertIn("omarchy_major", text)
             self.assertIn("omarchy_bindings", text)
             del golden
+
+    def test_udiskie_unlock_uploads_smoke_without_qemu_system(self) -> None:
+        fake = _FakeRun()
+        recorded_argv: list[list[str]] = []
+
+        def popen(argv, **kwargs):
+            name = Path(str(argv[0])).name if argv else ""
+            if name.startswith("qemu-system"):
+                recorded_argv.append(list(argv))
+                return _DummyProc()
+            raise AssertionError(f"unexpected Popen: {argv}")
+
+        def fake_overlay(golden, overlay, **kwargs):
+            dest = Path(overlay)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"overlay")
+            return dest
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache, golden = _cache_with_golden(tmp, "omarchy-4")
+            host = _host_ok(tmp)
+            install_sh = tmp / "install.sh"
+            install_sh.write_text("#!/bin/bash\n", encoding="utf-8")
+            buf = io.StringIO()
+            err = io.StringIO()
+            with (
+                redirect_stdout(buf),
+                redirect_stderr(err),
+                patch.object(Machine, "shutdown", return_value="kill"),
+                patch(
+                    "strataqemu.tests_spec.qmp_screendump", return_value=False
+                ),
+            ):
+                code = run_run_test(
+                    "omarchy-4",
+                    udiskie_unlock=True,
+                    keep=True,
+                    cache_dir=cache,
+                    check_host_fn=lambda: host,
+                    run=fake,
+                    popen=popen,
+                    create_overlay_fn=fake_overlay,
+                    settle_s=0,
+                    install_sh_path=install_sh,
+                )
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertIn("udiskie-unlock ok", buf.getvalue())
+            blob = " ".join(str(c) for c in fake.calls)
+            self.assertIn("smoke-udiskie-unlock.sh", blob)
+            self.assertNotIn("smoke-install.sh", blob)
+            result_files = list((cache / "runs").glob("*/result.json"))
+            self.assertTrue(result_files)
+            text = result_files[0].read_text(encoding="utf-8")
+            for name in UDISKIE_UNLOCK_STEPS:
+                self.assertIn(f'"name": "{name}"', text)
+            self.assertIn("udiskie_unlock_cases", text)
+            del golden
+
+    def test_udiskie_unlock_rejects_other_guests(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with (
+            redirect_stdout(buf),
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+        ):
+            code = main(["run-test", "--", "ubuntu-2404", "--udiskie-unlock"])
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn(UDISKIE_UNLOCK_FAIL_CLOSED, err.getvalue())
+        popen.assert_not_called()
+        run.assert_not_called()
+
+    def test_udiskie_unlock_exclusive_with_session_only(self) -> None:
+        err = io.StringIO()
+        with (
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+        ):
+            code = main(
+                [
+                    "run-test",
+                    "--",
+                    "arch",
+                    "--udiskie-unlock",
+                    "--session-only",
+                ]
+            )
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn(UDISKIE_UNLOCK_EXCLUSIVE, err.getvalue())
+        popen.assert_not_called()
+        run.assert_not_called()
+
+    def test_udiskie_unlock_exclusive_with_install_from(self) -> None:
+        err = io.StringIO()
+        with (
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+        ):
+            code = main(
+                [
+                    "run-test",
+                    "--",
+                    "arch",
+                    "--udiskie-unlock",
+                    "--install-from",
+                    "release",
+                ]
+            )
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn(UDISKIE_UNLOCK_EXCLUSIVE, err.getvalue())
+        popen.assert_not_called()
+        run.assert_not_called()
+
+    def test_udiskie_unlock_exclusive_with_omarchy_bindings(self) -> None:
+        err = io.StringIO()
+        with (
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+        ):
+            code = main(
+                [
+                    "run-test",
+                    "--",
+                    "omarchy-4",
+                    "--udiskie-unlock",
+                    "--omarchy-bindings",
+                ]
+            )
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn(UDISKIE_UNLOCK_EXCLUSIVE, err.getvalue())
+        popen.assert_not_called()
+        run.assert_not_called()
+
+    def test_udiskie_unlock_exclusive_with_update_from(self) -> None:
+        err = io.StringIO()
+        with (
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+        ):
+            code = main(
+                [
+                    "run-test",
+                    "--",
+                    "arch",
+                    "--udiskie-unlock",
+                    "--update-from",
+                    "0.15.0",
+                ]
+            )
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn(UDISKIE_UNLOCK_EXCLUSIVE, err.getvalue())
+        popen.assert_not_called()
+        run.assert_not_called()
+
+    def test_udiskie_unlock_missing_install_sh_env_fail_closed_no_qemu(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        missing = Path("/tmp/does-not-exist-strata-install.sh")
+        old = os.environ.get(config.INSTALL_SH_ENV)
+        os.environ[config.INSTALL_SH_ENV] = str(missing)
+        try:
+            with (
+                redirect_stdout(buf),
+                redirect_stderr(err),
+                patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+                patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+            ):
+                code = main(
+                    ["run-test", "--", "omarchy-4", "--udiskie-unlock"]
+                )
+            self.assertEqual(code, 2, err.getvalue())
+            self.assertIn(INSTALL_SH_MISSING_PATH, err.getvalue())
+            popen.assert_not_called()
+            run.assert_not_called()
+        finally:
+            if old is None:
+                os.environ.pop(config.INSTALL_SH_ENV, None)
+            else:
+                os.environ[config.INSTALL_SH_ENV] = old
 
     def test_omarchy_bindings_rejects_other_guests(self) -> None:
         buf = io.StringIO()

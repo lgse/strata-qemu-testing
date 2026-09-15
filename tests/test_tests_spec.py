@@ -54,6 +54,10 @@ from strataqemu.tests_spec import (
     omarchy_bindings_command,
     omarchy_detect_command,
     omarchy_install_major,
+    smoke_udiskie_unlock_script,
+    supports_udiskie_unlock,
+    udiskie_unlock_command,
+    udiskie_unlock_install_sh_fixture,
     parse_archive_version,
     parse_install_sh_sha256,
     parse_name_has_owner,
@@ -65,8 +69,11 @@ from strataqemu.tests_spec import (
     previous_release_archive_name,
     previous_release_url,
     run_install_from_release_steps,
+    UDISKIE_UNLOCK_FAIL_CLOSED,
+    UDISKIE_UNLOCK_STEPS,
     run_omarchy_bindings_steps,
     run_session_only_steps,
+    run_udiskie_unlock_steps,
     run_update_from_steps,
     screenshot_tool_for_compositor,
     sha256_file,
@@ -181,6 +188,58 @@ class _FakeRun:
                 0,
                 stdout=f"BINDINGS_KIND={kind}\nBINDINGS_PATH={path}\n",
             )
+        if "smoke-luks-hotplug.sh" in remote:
+            if "SMOKE_LUKS_CASE=wrap" in remote:
+                return _completed(
+                    0,
+                    stdout="WRAPPED=1\nHOOK_LOG=/tmp/strata-luks-hook.log\n",
+                )
+            return _completed(
+                0,
+                stdout=(
+                    "STRATA_CALLED=1\n"
+                    "LUKS_DEV=vdc\n"
+                    "LUKS_SERIAL=strata-luks\n"
+                    "HOOK_LINE=--udiskie-hook device_added crypto /dev/vdc uuid\n"
+                ),
+            )
+        if "udiskie/config.yml" in remote:
+            return _completed(0, stdout="HOOK_CONFIG=1\n")
+        if "pacman -S --needed --noconfirm udiskie" in remote and "gtk4" not in remote:
+            return _completed(0, stdout="UDISKIE=ok\n")
+        if "printf 'UDISKIE=" in remote:
+            return _completed(0, stdout="UDISKIE=ok\n")
+        if "smoke-udiskie-unlock.sh" in remote:
+            if "SMOKE_UDISKIE_CASE=parse-args" in remote:
+                with_flag = (
+                    "yes" if "--with-udiskie-unlock" in remote else "ask"
+                )
+                return _completed(
+                    0,
+                    stdout=(
+                        "NON_INTERACTIVE=yes\n"
+                        f"WITH_UDISKIE_UNLOCK={with_flag}\n"
+                        "BIN_CALLS=0\n"
+                    ),
+                )
+            calls = "0"
+            on_path = "1" if "SMOKE_UDISKIE_STUB=1" in remote else "0"
+            if (
+                "SMOKE_PROMPT=yes" in remote
+                and "SMOKE_UDISKIE_STUB=1" in remote
+                and "SMOKE_MARKER=1" in remote
+            ):
+                calls = "1"
+            stdout = (
+                f"BIN_CALLS={calls}\n"
+                f"UDISKIE_ON_PATH={on_path}\n"
+                "RELEASE_SUPPORTS=1\n"
+                "UDISKIE_RAN=0\n"
+                "DECOY_CALLS=0\n"
+            )
+            if calls == "1":
+                stdout += "BIN_ARGV=--install-udiskie-unlock\n"
+            return _completed(0, stdout=stdout)
         if "gnome-screenshot" in remote:
             return _completed(0)
         if " grim " in f" {remote} " or remote.strip().startswith("grim "):
@@ -1256,6 +1315,126 @@ class OmarchyHelperTests(unittest.TestCase):
         self.assertTrue(smoke_omarchy_bindings_script().is_file())
         self.assertEqual(parse_smoke_kv("DETECTED_MAJOR=\n", "DETECTED_MAJOR"), "")
         self.assertEqual(parse_smoke_kv("DETECTED_MAJOR=4\n", "DETECTED_MAJOR"), "4")
+
+
+class UdiskieUnlockFlowTests(unittest.TestCase):
+    def test_omarchy4_uploads_smoke_and_runs_cases(self) -> None:
+        fake = _FakeRun()
+        fake.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            install_sh = tmp / "install.sh"
+            install_sh.write_text("#!/bin/bash\n", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            commands: list[str] = []
+            steps, extras = run_udiskie_unlock_steps(
+                machine,
+                guest=load_guest("omarchy-4"),
+                screenshot_dest=tmp / "screenshot.png",
+                session_timeout=5,
+                run=fake,
+                commands=commands,
+                sleep=lambda _s: None,
+                install_sh_path=install_sh,
+            )
+        self.assertEqual([s["name"] for s in steps], list(UDISKIE_UNLOCK_STEPS))
+        blob = "\n".join(commands)
+        self.assertIn("smoke-udiskie-unlock.sh", blob)
+        self.assertNotIn("smoke-install.sh", blob)
+        self.assertIn("SMOKE_UDISKIE_CASE=parse-args", blob)
+        self.assertIn("--with-udiskie-unlock", blob)
+        self.assertIn("SMOKE_UDISKIE_STUB=1", blob)
+        self.assertIn("SMOKE_MARKER=1", blob)
+        self.assertIn("SMOKE_PROMPT=yes", blob)
+        self.assertIn("SMOKE_OMARCHY_MAJOR=4", blob)
+        self.assertIn("eligible-prompt-yes", extras["udiskie_unlock_cases"])
+        oracle = [s for s in steps if s["name"] == "udiskie-unlock"][0]
+        self.assertEqual(oracle["status"], "pass")
+
+    def test_arch_runs_host_udiskie_ignored_case(self) -> None:
+        fake = _FakeRun()
+        fake.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            install_sh = tmp / "install.sh"
+            install_sh.write_text("#!/bin/bash\n", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            commands: list[str] = []
+            steps, extras = run_udiskie_unlock_steps(
+                machine,
+                guest=load_guest("arch"),
+                screenshot_dest=tmp / "screenshot.png",
+                session_timeout=5,
+                run=fake,
+                commands=commands,
+                sleep=lambda _s: None,
+                install_sh_path=install_sh,
+            )
+        blob = "\n".join(commands)
+        self.assertIn("SMOKE_ARCH_BASED=yes", blob)
+        self.assertIn("SMOKE_HOST_UDISKIE=1", blob)
+        self.assertNotIn("SMOKE_OMARCHY_MAJOR=", blob)
+        self.assertIn("arch-no-stub-ask", extras["udiskie_unlock_cases"])
+        self.assertEqual([s["name"] for s in steps], list(UDISKIE_UNLOCK_STEPS))
+
+    def test_ubuntu_guest_is_not_supported(self) -> None:
+        fake = _FakeRun()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            with self.assertRaises(SessionSmokeError) as ctx:
+                run_udiskie_unlock_steps(
+                    machine,
+                    guest=load_guest("ubuntu-2404"),
+                    screenshot_dest=tmp / "screenshot.png",
+                    session_timeout=5,
+                    run=fake,
+                    sleep=lambda _s: None,
+                    install_sh_path=tmp / "install.sh",
+                )
+        self.assertEqual(str(ctx.exception), UDISKIE_UNLOCK_FAIL_CLOSED)
+
+    def test_command_and_fixture_helpers(self) -> None:
+        self.assertTrue(supports_udiskie_unlock("arch"))
+        self.assertTrue(supports_udiskie_unlock(load_guest("omarchy-3")))
+        self.assertFalse(supports_udiskie_unlock("ubuntu-2404"))
+        self.assertTrue(smoke_udiskie_unlock_script().is_file())
+        self.assertTrue(udiskie_unlock_install_sh_fixture().is_file())
+        remote = udiskie_unlock_command(
+            case="configure",
+            omarchy_major="4",
+            arch_based="yes",
+            udiskie_stub=True,
+            marker=True,
+            prompt="yes",
+        )
+        self.assertIn("SMOKE_UDISKIE_CASE=configure", remote)
+        self.assertIn("SMOKE_OMARCHY_MAJOR=4", remote)
+        self.assertIn("SMOKE_UDISKIE_STUB=1", remote)
+        self.assertIn("SMOKE_MARKER=1", remote)
+        self.assertIn("bash /tmp/smoke-udiskie-unlock.sh", remote)
+        self.assertNotIn("--with-udiskie-unlock", INSTALL_SH_FLAGS)
 
 
 class UpdateFromStepsTests(unittest.TestCase):

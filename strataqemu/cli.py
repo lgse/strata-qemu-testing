@@ -325,6 +325,27 @@ def build_parser() -> argparse.ArgumentParser:
             "list with STRATA_QEMU_UPDATE_FROM (comma-separated)."
         ),
     )
+    run_test.add_argument(
+        "--udiskie-unlock",
+        action="store_true",
+        help=(
+            "Omarchy/Arch: source install.sh udiskie-unlock helpers with PATH "
+            "and BIN_PATH isolated (lgse/strata#537). Does not spawn real "
+            "udiskie or rewrite host config. Optional STRATA_QEMU_INSTALL_SH "
+            "uploads a host install.sh; otherwise the committed fixture is used."
+        ),
+    )
+    run_test.add_argument(
+        "--luks-hotplug",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help=(
+            "Omarchy/Arch: install a host Strata binary/archive/checkout, "
+            "register the udiskie unlock handler, hotplug a LUKS disk, and "
+            "assert Strata is called (lgse/strata#537)."
+        ),
+    )
 
     vm_run = sub.add_parser(
         "vm-run",
@@ -520,6 +541,8 @@ def main(argv: list[str] | None = None) -> int:
             keep=args.keep,
             omarchy_bindings=args.omarchy_bindings,
             update_from=args.update_from,
+            udiskie_unlock=args.udiskie_unlock,
+            luks_hotplug=args.luks_hotplug,
         )
 
     if args.command == "vm-run":

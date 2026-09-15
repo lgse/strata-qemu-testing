@@ -235,6 +235,34 @@ class CliHelpTests(unittest.TestCase):
         text = buf.getvalue() + err.getvalue()
         self.assertIn("--omarchy-bindings", text)
 
+    def test_run_test_help_includes_udiskie_unlock(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["run-test", "--help"])
+        self.assertEqual(code, 0)
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn("--udiskie-unlock", text)
+        self.assertIn("STRATA_QEMU_INSTALL_SH", text)
+
+    def test_run_test_help_includes_luks_hotplug(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["run-test", "--help"])
+        self.assertEqual(code, 0)
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn("--luks-hotplug", text)
+        self.assertIn("PATH", text)
+
+    def test_luks_hotplug_binds_path(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["run-test", "omarchy-4", "--luks-hotplug", "/tmp/strata"]
+        )
+        self.assertEqual(args.luks_hotplug, "/tmp/strata")
+        self.assertFalse(args.udiskie_unlock)
+
     def test_run_test_help_includes_update_from(self) -> None:
         buf = io.StringIO()
         err = io.StringIO()
