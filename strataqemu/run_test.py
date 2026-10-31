@@ -37,6 +37,7 @@ from strataqemu.ports import (
 )
 from strataqemu.qemu import Machine, build_qemu_argv
 from strataqemu.tests_spec import (
+    APPARMOR_BWRAP_RESTRICT_UNSUPPORTED,
     INSTALL_FROM_FAIL_CLOSED,
     INSTALL_SH_MISSING_PATH,
     LOCAL_ARCHIVE_MISSING_PATH,
@@ -49,10 +50,12 @@ from strataqemu.tests_spec import (
     compositor_process_name,
     missing_golden_message,
     parse_update_from_version,
+    run_apparmor_bwrap_restrict_step,
     run_install_from_release_steps,
     run_omarchy_bindings_steps,
     run_session_only_steps,
     run_update_from_steps,
+    supports_apparmor_bwrap_restrict,
     supports_install_from_release,
     supports_omarchy_bindings,
     supports_update_from,
@@ -339,14 +342,14 @@ _USAGE_LINES = {
     "vm-live": (
         "usage: python -m strataqemu vm-live "
         "(--from-tag VERSION | --from-local PATH) "
-        "[--graphical] [--headless] [--keep] <guest>"
+        "[--graphical] [--headless] [--apparmor-bwrap-restrict] [--keep] <guest>"
     ),
     "run-test": (
         "usage: python -m strataqemu run-test "
         "[--session-only | --install-from release | "
         "--install-from local-archive PATH | --omarchy-bindings | "
         "--update-from VERSION] "
-        "[--keep] <guest>"
+        "[--apparmor-bwrap-restrict] [--keep] <guest>"
     ),
 }
 
@@ -384,6 +387,7 @@ def run_run_test(
     install_sh_path: Path | str | None = None,
     omarchy_bindings: bool = False,
     update_from: str | None = None,
+    apparmor_bwrap_restrict: bool = False,
 ) -> int:
     """CLI body for ``run-test``. Never calls ``image-build``."""
     loaded = _load_or_usage(guest_id, "run-test")
@@ -399,6 +403,9 @@ def run_run_test(
         return 2
     if update_from and (session_only or install_from or omarchy_bindings):
         print(UPDATE_FROM_EXCLUSIVE, file=sys.stderr)
+        return 2
+    if apparmor_bwrap_restrict and not supports_apparmor_bwrap_restrict(guest):
+        print(f"run-test: {APPARMOR_BWRAP_RESTRICT_UNSUPPORTED}", file=sys.stderr)
         return 2
 
     resolved_from: str | None = None
@@ -520,6 +527,10 @@ def run_run_test(
         shot = run_dir / "screenshot.png"
         qmp_path = run_dir / "qmp-session.png"
         extras: dict = {}
+        if apparmor_bwrap_restrict:
+            result["steps"] = [
+                run_apparmor_bwrap_restrict_step(machine, run=run, commands=recorded)
+            ]
         if install_ok:
             steps, extras = run_install_from_release_steps(
                 machine,
@@ -571,7 +582,7 @@ def run_run_test(
         result.update(
             {
                 "ok": True,
-                "steps": steps,
+                "steps": result["steps"] + steps,
                 "screenshot": str(shot),
                 "seconds": round(time.monotonic() - started, 1),
             }

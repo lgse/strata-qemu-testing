@@ -26,6 +26,9 @@ first.
 | `--update-from` | `run_update_from_steps` | `session`, `install-previous`, `version-previous`, `about-version-before`, `update`, `version`, `desktop-entry`, `window`, `about-version-after` |
 | `--omarchy-bindings` | `run_omarchy_bindings_steps` | `session`, `omarchy-detect`, `omarchy-bindings`, `screenshot` |
 
+`--apparmor-bwrap-restrict` is not a flow. It is a ubuntu-2404 modifier
+that `run_run_test` runs as the first step (`apparmor-bwrap-restrict`)
+before any flow; `vm-live` runs it before installing Strata.
 `--omarchy-bindings` is Omarchy-only and exclusive with the other flows.
 `--update-from` is exclusive with the other three. Do not add
 detect/bindings oracles to `--install-from` or `--update-from`.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import subprocess
 import tempfile
@@ -27,6 +28,8 @@ from strataqemu.run_test import (
     vm_run_qemu_argv,
 )
 from strataqemu.tests_spec import (
+    APPARMOR_BWRAP_RESTRICT_LOG,
+    APPARMOR_BWRAP_RESTRICT_UNSUPPORTED,
     DEFAULT_UPDATE_FROM_VERSIONS,
     INSTALL_FROM_FAIL_CLOSED,
     INSTALL_SH_MISSING_PATH,
@@ -72,6 +75,16 @@ class _DummyProc:
         return None
 
 
+APPARMOR_OK_STDOUT = (
+    "RESTRICT_UNPRIVILEGED_USERNS=1\n"
+    "PROFILES=bwrap,unpriv_bwrap\n"
+    "PLAIN_BWRAP_RC=0\n"
+    "CHILD_LABEL=bwrap//&unpriv_bwrap (enforce)\n"
+    "NESTED_UNSHARE_RC=1\n"
+    "NESTED_UNSHARE_ERR=unshare: unshare failed: Operation not permitted\n"
+)
+
+
 class _FakeRun:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
@@ -107,6 +120,8 @@ class _FakeRun:
             return subprocess.CompletedProcess(
                 argv, 0, "/usr/bin/gnome-screenshot\n", ""
             )
+        if "smoke-apparmor-bwrap.sh" in remote:
+            return subprocess.CompletedProcess(argv, 0, APPARMOR_OK_STDOUT, "")
         if "smoke-session.sh" in remote:
             return subprocess.CompletedProcess(
                 argv,
@@ -644,6 +659,102 @@ class SessionOnlyWiringTests(unittest.TestCase):
         self.assertIn("virtio-vga-gl", argv)
         self.assertEqual(_after(argv, "-display"), "gtk,gl=on")
         self.assertNotIn("-vnc", argv)
+
+
+class AppArmorBwrapRestrictWiringTests(unittest.TestCase):
+    def _run(self, tmp: Path, fake, guest_id: str = "ubuntu-2404"):
+        cache, _golden = _cache_with_golden(tmp, guest_id)
+        vars_template = tmp / "OVMF_VARS.4m.fd"
+        vars_template.write_bytes(b"vars")
+        host = _host_ok(tmp)
+        err = io.StringIO()
+        with (
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(err),
+            patch("strataqemu.run_test.find_ovmf_vars", return_value=vars_template),
+            patch.object(Machine, "shutdown", return_value="kill"),
+            patch("strataqemu.tests_spec.qmp_screendump", return_value=False),
+        ):
+            code = run_run_test(
+                guest_id,
+                session_only=True,
+                apparmor_bwrap_restrict=True,
+                keep=True,
+                cache_dir=cache,
+                check_host_fn=lambda: host,
+                run=fake,
+                popen=lambda argv, **kwargs: _DummyProc(),
+                create_overlay_fn=lambda golden, overlay, **kwargs: Path(overlay),
+                settle_s=0,
+            )
+        run_dirs = list((cache / "runs").iterdir())
+        return code, err.getvalue(), run_dirs
+
+    def test_non_ubuntu_guest_is_usage_error_without_spawning(self) -> None:
+        err = io.StringIO()
+        with (
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system),
+        ):
+            code = run_run_test(
+                "arch", session_only=True, apparmor_bwrap_restrict=True
+            )
+        self.assertEqual(code, 2)
+        self.assertIn(APPARMOR_BWRAP_RESTRICT_UNSUPPORTED, err.getvalue())
+        popen.assert_not_called()
+
+    def test_restriction_is_asserted_before_the_flow_and_recorded(self) -> None:
+        fake = _FakeRun()
+        with tempfile.TemporaryDirectory() as td:
+            code, err, run_dirs = self._run(Path(td), fake)
+            self.assertEqual(code, 0, err)
+            result = json.loads(
+                (run_dirs[0] / "result.json").read_text(encoding="utf-8")
+            )
+            record = run_dirs[0] / APPARMOR_BWRAP_RESTRICT_LOG
+            self.assertIn("NESTED_UNSHARE_RC=1", record.read_text(encoding="utf-8"))
+        names = [step["name"] for step in result["steps"]]
+        self.assertEqual(names, ["apparmor-bwrap-restrict", "session", "screenshot"])
+        apparmor = result["steps"][0]
+        self.assertEqual(apparmor["child_label"], "bwrap//&unpriv_bwrap (enforce)")
+        self.assertIn("Operation not permitted", apparmor["nested_unshare_error"])
+        remotes = [str(argv[-1]) for argv in fake.calls]
+        first_apparmor = next(
+            i for i, r in enumerate(remotes) if "smoke-apparmor-bwrap.sh" in r
+        )
+        first_session = next(
+            i for i, r in enumerate(remotes) if "smoke-session.sh" in r
+        )
+        self.assertLess(first_apparmor, first_session)
+
+    def test_restriction_not_in_effect_fails_run(self) -> None:
+        fake = _FakeRun()
+
+        def run(argv, **kwargs):
+            if "bash /tmp/smoke-apparmor-bwrap.sh" in str(argv[-1]):
+                fake.calls.append(list(argv))
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    "NESTED_UNSHARE_RC=0\n",
+                    "apparmor-bwrap: nested unshare -Urm inside bwrap succeeded\n",
+                )
+            return fake(argv, **kwargs)
+
+        with tempfile.TemporaryDirectory() as td:
+            code, err, run_dirs = self._run(Path(td), run)
+            self.assertEqual(code, 1)
+            result = json.loads(
+                (run_dirs[0] / "result.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue((run_dirs[0] / APPARMOR_BWRAP_RESTRICT_LOG).is_file())
+        self.assertIn("nested unshare -Urm inside bwrap succeeded", err)
+        self.assertIn("restriction not in effect", result["error"])
+        self.assertFalse(
+            any("smoke-session.sh" in str(argv[-1]) for argv in fake.calls)
+        )
 
 
 class HelpAndMiseTests(unittest.TestCase):

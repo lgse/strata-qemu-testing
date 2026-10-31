@@ -245,6 +245,32 @@ class CliHelpTests(unittest.TestCase):
         self.assertIn("--update-from", text)
         self.assertIn("STRATA_QEMU_UPDATE_FROM", text)
 
+    def test_apparmor_bwrap_restrict_is_forwarded(self) -> None:
+        for argv, target in (
+            (
+                [
+                    "run-test",
+                    "ubuntu-2404",
+                    "--session-only",
+                    "--apparmor-bwrap-restrict",
+                ],
+                "strataqemu.run_test.run_run_test",
+            ),
+            (
+                [
+                    "vm-live",
+                    "ubuntu-2404",
+                    "--from-tag",
+                    "1.1.1",
+                    "--apparmor-bwrap-restrict",
+                ],
+                "strataqemu.vm_live.run_vm_live",
+            ),
+        ):
+            with self.subTest(command=argv[0]), patch(target, return_value=0) as body:
+                self.assertEqual(main(argv), 0)
+            self.assertTrue(body.call_args.kwargs["apparmor_bwrap_restrict"])
+
     def test_update_from_binds_version(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
