@@ -32,6 +32,7 @@ SMOKE_UPDATE = REPO_ROOT / "guest-tests" / "smoke-update.sh"
 SMOKE_ABOUT = REPO_ROOT / "guest-tests" / "smoke-about.sh"
 SMOKE_OMARCHY_DETECT = REPO_ROOT / "guest-tests" / "smoke-omarchy-detect.sh"
 SMOKE_OMARCHY_BINDINGS = REPO_ROOT / "guest-tests" / "smoke-omarchy-bindings.sh"
+SMOKE_APPARMOR_BWRAP = REPO_ROOT / "guest-tests" / "smoke-apparmor-bwrap.sh"
 FIXTURE_PR743 = REPO_ROOT / "tests" / "fixtures" / "omarchy-detect" / "install-pr743.sh"
 FIXTURE_MAIN = REPO_ROOT / "tests" / "fixtures" / "omarchy-detect" / "install-main.sh"
 UID = 1000
@@ -1032,3 +1033,144 @@ class SmokeAboutScriptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SUDO_FAKE = """#!/usr/bin/env bash
+[[ ${1:-} == -n ]] && shift
+exec "$@"
+"""
+
+APT_GET_FAKE = """#!/usr/bin/env bash
+printf 'DEBIAN_FRONTEND=%s %s\\n' "${DEBIAN_FRONTEND:-}" "$*" >>"$FAKE_LOG"
+mkdir -p "$(dirname "$APPARMOR_EXTRA_PROFILE")"
+printf 'profile bwrap /usr/bin/bwrap {}\\n' >"$APPARMOR_EXTRA_PROFILE"
+"""
+
+APPARMOR_PARSER_FAKE = """#!/usr/bin/env bash
+printf 'apparmor_parser %s\\n' "$*" >>"$FAKE_LOG"
+"""
+
+# Drops the fixed sandbox options the smoke passes, then plays the command.
+BWRAP_FAKE = """#!/usr/bin/env bash
+shift 8
+case "$1" in
+  true) exit "${FAKE_PLAIN_RC:-0}" ;;
+  cat) printf '%s\\0' "$FAKE_LABEL" ;;
+  unshare)
+    if [[ ${FAKE_NESTED:-eperm} == eperm ]]; then
+      echo 'unshare: unshare failed: Operation not permitted' >&2
+      exit 1
+    fi
+    ;;
+esac
+"""
+
+
+class SmokeAppArmorBwrapScriptTests(unittest.TestCase):
+    def _run(
+        self,
+        tmp: Path,
+        *,
+        profile_present: bool = True,
+        profiles: str = (
+            "bwrap (enforce)\nunpriv_bwrap (enforce)\nfirefox (unconfined)\n"
+        ),
+        extra_env: dict[str, str] | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        bin_dir = tmp / "bin"
+        for name, text in (
+            ("sudo", SUDO_FAKE),
+            ("apt-get", APT_GET_FAKE),
+            ("apparmor_parser", APPARMOR_PARSER_FAKE),
+            ("bwrap", BWRAP_FAKE),
+        ):
+            _write_exec(bin_dir / name, text)
+        src = tmp / "extra-profiles" / "bwrap-userns-restrict"
+        if profile_present:
+            src.parent.mkdir(parents=True)
+            src.write_text("profile bwrap /usr/bin/bwrap {}\n", encoding="utf-8")
+        (tmp / "sysctl").write_text("1\n", encoding="utf-8")
+        (tmp / "profiles").write_text(profiles, encoding="utf-8")
+        (tmp / "apparmor.d").mkdir()
+        log = tmp / "fake.log"
+        env = {
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "FAKE_LOG": str(log),
+            "FAKE_LABEL": "bwrap//&unpriv_bwrap (enforce)",
+            "APPARMOR_EXTRA_PROFILE": str(src),
+            "APPARMOR_PROFILE_DEST": str(tmp / "apparmor.d" / "bwrap-userns-restrict"),
+            "APPARMOR_SYSCTL": str(tmp / "sysctl"),
+            "APPARMOR_PROFILES_LIST": str(tmp / "profiles"),
+        }
+        env.pop("DEBIAN_FRONTEND", None)
+        if extra_env:
+            env.update(extra_env)
+        completed = subprocess.run(
+            ["bash", str(SMOKE_APPARMOR_BWRAP)],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return completed, log
+
+    def test_enforced_profile_reports_denied_nested_userns(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            completed, log = self._run(tmp)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue((tmp / "apparmor.d" / "bwrap-userns-restrict").is_file())
+            self.assertIn("apparmor_parser -r", log.read_text(encoding="utf-8"))
+        out = completed.stdout
+        self.assertEqual(parse_smoke_kv(out, "RESTRICT_UNPRIVILEGED_USERNS"), "1")
+        self.assertEqual(parse_smoke_kv(out, "PROFILES"), "bwrap,unpriv_bwrap")
+        self.assertEqual(parse_smoke_kv(out, "PLAIN_BWRAP_RC"), "0")
+        self.assertEqual(
+            parse_smoke_kv(out, "CHILD_LABEL"), "bwrap//&unpriv_bwrap (enforce)"
+        )
+        self.assertEqual(parse_smoke_kv(out, "NESTED_UNSHARE_RC"), "1")
+        self.assertEqual(
+            parse_smoke_kv(out, "NESTED_UNSHARE_ERR"),
+            "unshare: unshare failed: Operation not permitted",
+        )
+
+    def test_missing_profile_installs_apparmor_profiles_noninteractively(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            completed, log = self._run(Path(td), profile_present=False)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn(
+                "DEBIAN_FRONTEND=noninteractive install -y -q apparmor-profiles",
+                log.read_text(encoding="utf-8"),
+            )
+
+    def test_nested_userns_allowed_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            completed, _log = self._run(
+                Path(td), extra_env={"FAKE_NESTED": "allowed"}
+            )
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(parse_smoke_kv(completed.stdout, "NESTED_UNSHARE_RC"), "0")
+        self.assertIn("nested unshare -Urm inside bwrap succeeded", completed.stderr)
+
+    def test_unconfined_bwrap_child_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            completed, _log = self._run(
+                Path(td), extra_env={"FAKE_LABEL": "unconfined"}
+            )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("not confined by unpriv_bwrap", completed.stderr)
+
+    def test_profile_not_enforcing_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            completed, _log = self._run(
+                Path(td), profiles="bwrap (complain)\nunpriv_bwrap (complain)\n"
+            )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("not both enforcing", completed.stderr)
+
+    def test_stock_ubuntu_plain_sandbox_failure_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            completed, _log = self._run(Path(td), extra_env={"FAKE_PLAIN_RC": "1"})
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("plain bwrap sandbox failed", completed.stderr)

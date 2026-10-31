@@ -13,7 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +42,7 @@ from strataqemu.sample_tree import (
     build_fixtures_archive,
 )
 from strataqemu.tests_spec import (
+    APPARMOR_BWRAP_RESTRICT_UNSUPPORTED,
     GUEST_ARCHIVE_REMOTE,
     INSTALL_TIMEOUT_S,
     SESSION_TIMEOUT_S,
@@ -53,11 +54,13 @@ from strataqemu.tests_spec import (
     normalize_version,
     parse_archive_version,
     parse_smoke_kv,
+    run_apparmor_bwrap_restrict_step,
     run_session_step,
     scp_to_guest,
     session_env_from_exports,
     smoke_update_script,
     ssh_run,
+    supports_apparmor_bwrap_restrict,
     supports_install_from_release,
     update_smoke_command,
 )
@@ -86,6 +89,14 @@ ARCH_RUNTIME_PACKAGES = (
     "xdg-utils",
 )
 
+# GNOME blanks and locks an idle session within minutes. A hidden Strata
+# window requests no thumbnails, so a live session must stay awake.
+GNOME_IDLE_SETTINGS = (
+    ("org.gnome.desktop.session", "idle-delay", "0"),
+    ("org.gnome.desktop.screensaver", "lock-enabled", "false"),
+    ("org.gnome.settings-daemon.plugins.power", "idle-dim", "false"),
+)
+
 VM_LIVE_SOURCE_REQUIRED = (
     "vm-live: pass --from-tag VERSION or --from-local PATH"
 )
@@ -106,7 +117,7 @@ VM_LIVE_TAG_BAD = "vm-live: --from-tag is not a Strata release tag"
 VM_LIVE_USAGE = (
     "usage: python -m strataqemu vm-live "
     "(--from-tag VERSION | --from-local PATH) "
-    "[--graphical] [--headless] [--keep] <guest>"
+    "[--graphical] [--headless] [--apparmor-bwrap-restrict] [--keep] <guest>"
 )
 
 
@@ -116,6 +127,18 @@ class LocalStrata:
 
     kind: str
     path: Path
+
+
+def disable_gnome_idle_lock_command(env: Mapping[str, str]) -> str:
+    """Keep the GNOME session awake and unlocked for a human operator."""
+    settings = " && ".join(
+        f"gsettings set {schema} {key} {value}"
+        for schema, key, value in GNOME_IDLE_SETTINGS
+    )
+    return (
+        f"{env_prefix(env)} bash -c {shlex.quote(settings)} "
+        "&& sudo -n loginctl unlock-sessions"
+    )
 
 
 def parse_from_tag(value: str | None) -> str:
@@ -399,6 +422,7 @@ def run_vm_live(
     settle_s: float = SETTLE_S,
     graphical_ui: str | None = None,
     wait: bool = True,
+    apparmor_bwrap_restrict: bool = False,
 ) -> int:
     """CLI body for ``vm-live``. Throwaway overlay; the golden is never written."""
     loaded = _load_or_usage(guest_id, "vm-live")
@@ -416,6 +440,9 @@ def run_vm_live(
         return 2
     if not supports_install_from_release(guest):
         print(VM_LIVE_FAIL_CLOSED, file=sys.stderr)
+        return 2
+    if apparmor_bwrap_restrict and not supports_apparmor_bwrap_restrict(guest):
+        print(f"vm-live: {APPARMOR_BWRAP_RESTRICT_UNSUPPORTED}", file=sys.stderr)
         return 2
 
     tag: str | None = None
@@ -484,6 +511,15 @@ def run_vm_live(
             inherit_stdio=True,
         )
         wait_ssh(machine, timeout=guest.boot_timeout_s, run=run)
+        if apparmor_bwrap_restrict:
+            apparmor = run_apparmor_bwrap_restrict_step(
+                machine, run=run, commands=recorded
+            )
+            print(
+                "vm-live: AppArmor bwrap-userns-restrict enforced; "
+                f"nested unshare in bwrap: {apparmor['nested_unshare_error']}",
+                flush=True,
+            )
         exports = run_session_step(
             machine,
             compositor=compositor_process_name(guest),
@@ -493,6 +529,20 @@ def run_vm_live(
         )
         env = session_env_from_exports(exports)
         compositor = compositor_process_name(guest)
+        if compositor == "gnome-shell":
+            awake = ssh_run(
+                machine,
+                disable_gnome_idle_lock_command(env),
+                timeout=30,
+                run=run,
+                commands=recorded,
+            )
+            if awake.returncode != 0:
+                print(
+                    "vm-live: could not disable GNOME idle lock: "
+                    f"{(awake.stderr or awake.stdout).strip()}",
+                    file=sys.stderr,
+                )
         if tag is not None:
             _install_from_tag(
                 machine,
@@ -541,9 +591,9 @@ def run_vm_live(
             run=run,
             commands=recorded,
         )
-        print(f"vm-live: {guest.id} ssh_port={machine.ssh_port}")
-        print(f"vm-live: strata from {source_note}")
-        print(f"vm-live: fixtures {fixtures}")
+        print(f"vm-live: {guest.id} ssh_port={machine.ssh_port}", flush=True)
+        print(f"vm-live: strata from {source_note}", flush=True)
+        print(f"vm-live: fixtures {fixtures}", flush=True)
         if wait and machine._proc is not None:
             machine._proc.wait()
         return 0

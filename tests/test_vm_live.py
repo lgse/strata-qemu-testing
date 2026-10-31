@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -20,7 +21,10 @@ from strataqemu.sample_tree import (
     png_1x1,
     write_sample_tree,
 )
-from strataqemu.tests_spec import missing_golden_message
+from strataqemu.tests_spec import (
+    APPARMOR_BWRAP_RESTRICT_UNSUPPORTED,
+    missing_golden_message,
+)
 from strataqemu.vm_live import (
     ARCH_RUNTIME_PACKAGES,
     VM_LIVE_LOCAL_EMPTY,
@@ -525,3 +529,108 @@ class VmLiveWiringTests(unittest.TestCase):
             runs = cache / "runs"
             self.assertTrue(runs.is_dir())
             self.assertEqual(list(runs.iterdir()), [])
+
+
+class VmLiveSessionPrepTests(unittest.TestCase):
+    def _run(
+        self,
+        fake: _FakeRun,
+        *,
+        guest_id: str = "ubuntu-2404",
+        apparmor: bool = False,
+        run=None,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache, _golden = _cache_with_golden(tmp, guest_id)
+            vars_template = tmp / "OVMF_VARS.4m.fd"
+            vars_template.write_bytes(b"vars")
+            host = _host_ok(tmp)
+            buf = io.StringIO()
+            err = io.StringIO()
+            with (
+                redirect_stdout(buf),
+                redirect_stderr(err),
+                patch(
+                    "strataqemu.run_test.find_ovmf_vars",
+                    return_value=vars_template,
+                ),
+                patch.object(Machine, "shutdown", return_value="kill"),
+            ):
+                code = run_vm_live(
+                    guest_id,
+                    from_tag="0.15.0",
+                    graphical=False,
+                    keep=False,
+                    cache_dir=cache,
+                    check_host_fn=lambda: host,
+                    run=run or fake,
+                    popen=_popen_recorder([]),
+                    create_overlay_fn=_fake_overlay,
+                    settle_s=0,
+                    wait=False,
+                    apparmor_bwrap_restrict=apparmor,
+                )
+        remotes = [str(argv[-1]) for argv in fake.calls]
+        return code, buf.getvalue(), err.getvalue(), remotes
+
+    @staticmethod
+    def _index(remotes: list[str], needle: str) -> int:
+        return next(i for i, r in enumerate(remotes) if needle in r)
+
+    def test_apparmor_restriction_is_enforced_before_strata_launches(self) -> None:
+        code, out, err, remotes = self._run(_FakeRun(), apparmor=True)
+        self.assertEqual(code, 0, err)
+        apparmor = self._index(remotes, "bash /tmp/smoke-apparmor-bwrap.sh")
+        self.assertLess(apparmor, self._index(remotes, "smoke-update.sh"))
+        self.assertLess(apparmor, self._index(remotes, "nohup"))
+        self.assertIn("AppArmor bwrap-userns-restrict enforced", out)
+        self.assertIn("Operation not permitted", out)
+
+    def test_apparmor_flag_rejected_on_non_ubuntu_guest(self) -> None:
+        err = io.StringIO()
+        with (
+            redirect_stderr(err),
+            redirect_stdout(io.StringIO()),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+        ):
+            code = run_vm_live(
+                "arch", from_tag="0.15.0", apparmor_bwrap_restrict=True
+            )
+        self.assertEqual(code, 2)
+        self.assertIn(APPARMOR_BWRAP_RESTRICT_UNSUPPORTED, err.getvalue())
+        popen.assert_not_called()
+
+    def test_without_flag_no_apparmor_changes(self) -> None:
+        code, _out, err, remotes = self._run(_FakeRun())
+        self.assertEqual(code, 0, err)
+        self.assertFalse(any("apparmor" in r for r in remotes))
+
+    def test_gnome_idle_lock_is_disabled_before_strata_launches(self) -> None:
+        code, _out, err, remotes = self._run(_FakeRun())
+        self.assertEqual(code, 0, err)
+        idle = self._index(remotes, "idle-delay")
+        command = remotes[idle]
+        self.assertIn("gsettings set org.gnome.desktop.session idle-delay 0", command)
+        self.assertIn("org.gnome.desktop.screensaver lock-enabled false", command)
+        self.assertIn("loginctl unlock-sessions", command)
+        self.assertIn("DBUS_SESSION_BUS_ADDRESS=", command)
+        self.assertLess(idle, self._index(remotes, "nohup"))
+
+    def test_idle_lock_failure_warns_but_keeps_session(self) -> None:
+        fake = _FakeRun()
+
+        def run(argv, **kwargs):
+            if "gsettings" in str(argv[-1]):
+                fake.calls.append(list(argv))
+                return subprocess.CompletedProcess(argv, 1, "", "no schema\n")
+            return fake(argv, **kwargs)
+
+        code, _out, err, _remotes = self._run(fake, run=run)
+        self.assertEqual(code, 0, err)
+        self.assertIn("could not disable GNOME idle lock: no schema", err)
+
+    def test_hyprland_guest_skips_gnome_idle_settings(self) -> None:
+        code, _out, err, remotes = self._run(_FakeRun(), guest_id="arch")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(any("gsettings" in r for r in remotes))

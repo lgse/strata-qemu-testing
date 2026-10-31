@@ -174,6 +174,49 @@ Point `STRATA_QEMU_INSTALL_SH` at a PR checkout when `main` does not yet
 include `omarchy_major_from`; the token probes fail closed against the
 pre-#743 installer.
 
+### AppArmor bwrap-userns-restrict
+
+```bash
+mise run run-test -- ubuntu-2404 --install-from release --apparmor-bwrap-restrict
+mise run vm-live -- ubuntu-2404 --from-local PATH --apparmor-bwrap-restrict
+```
+
+`ubuntu-2404` only. Combines with any `run-test` flow and with `vm-live`.
+Right after SSH comes up, and before Strata is installed or launched, the
+guest installs `apparmor-profiles`, copies its
+`extra-profiles/bwrap-userns-restrict` into `/etc/apparmor.d`, and loads
+it. The step then asserts that the restriction is in effect:
+
+- `kernel.apparmor_restrict_unprivileged_userns` is `1`;
+- `bwrap` and `unpriv_bwrap` are both enforcing;
+- a plain `bwrap --unshare-all ... true` still succeeds;
+- the bwrap child runs as `bwrap//&unpriv_bwrap`;
+- `unshare -Urm true` inside bwrap fails with `Operation not permitted`.
+
+The output is saved to `apparmor-bwrap-restrict.txt` in the run directory
+and, for `run-test`, recorded as the first `result.json` step. If any
+assertion fails, the run fails. `vm-live` also prints the nested
+`unshare` error.
+
+#### Verifying lgse/strata#1926-style restrictions
+
+Ubuntu 24.04 ships `bwrap-userns-restrict` only in the `apparmor-profiles`
+extras. elementary OS 8 enables it. With the profile enforcing, bwrap
+children cannot create nested user namespaces, so a Strata sandbox worker
+that calls `unshare` again inside bwrap gets `EPERM`. To check a Strata
+build against that host:
+
+```bash
+mise run vm-live -- ubuntu-2404 --apparmor-bwrap-restrict \
+  --from-local ~/Downloads/strata-1.2.3-x86_64-unknown-linux-gnu.tar.gz
+```
+
+Build the binary or tarball on Ubuntu 24.04 or older (glibc 2.39); a
+binary linked against a newer glibc will not start in the guest. Strata
+starts on `~/fixtures` with the restriction already active. Open
+`~/fixtures/pictures` to check thumbnails and previews, and Settings to
+check what Strata reports about the sandbox.
+
 ### Output
 
 On success `run-test` prints the guest, the screenshot path, and the run
@@ -184,6 +227,7 @@ duration and details such as the `install.sh` digest and observed version.
 $CACHE/runs/<stamp>-<guest>/
   result.json        step results
   screenshot.png     in-guest screenshot
+  apparmor-bwrap-restrict.txt  AppArmor step output (--apparmor-bwrap-restrict)
   qmp-session.png    QEMU-side screendump (may be absent)
   ssh.log            every guest command and its output
   serial.log         guest console
@@ -226,7 +270,9 @@ Like `vm-run`, but waits for the autologin Wayland session, installs
 Strata, seeds `~/fixtures` with sample files (documents, a PNG, a zip,
 nested dirs, a symlink, a hidden file), and launches Strata on that
 directory. A GTK/SDL window is the default; pass `--headless` for SSH
-only.
+only. On GNOME guests, `vm-live` turns off idle blanking and the screen
+lock and unlocks the session. Otherwise GNOME would blank and lock it
+within minutes, and a hidden Strata window requests no thumbnails.
 
 `--from-tag VERSION` downloads that GitHub release inside the guest
 (`0.15.0` or `v0.15.0`). `--from-local PATH` copies a host binary, a
@@ -284,8 +330,9 @@ the command.
 | `mise run run-test -- <guest> --install-from local-archive PATH [--keep]` | Install from a host tarball. |
 | `mise run run-test -- <guest> --update-from VERSION [--keep]` | Seed a previous release, then run current `install.sh` to latest. |
 | `mise run run-test -- omarchy-3\|omarchy-4 --omarchy-bindings [--keep]` | Probe Omarchy detection and Hyprland bindings (optional `STRATA_QEMU_INSTALL_SH`). |
+| `mise run run-test -- ubuntu-2404 <flow> --apparmor-bwrap-restrict` | Enforce AppArmor `bwrap-userns-restrict` before the flow and assert nested user namespaces are denied. |
 | `mise run vm-run -- <guest> [--graphical] [--keep]` | Interactive throwaway overlay. |
-| `mise run vm-live -- <guest> (--from-tag VERSION \| --from-local PATH) [--headless] [--keep]` | Live overlay with Strata installed and `~/fixtures` sample files. |
+| `mise run vm-live -- <guest> (--from-tag VERSION \| --from-local PATH) [--headless] [--apparmor-bwrap-restrict] [--keep]` | Live overlay with Strata installed and `~/fixtures` sample files. |
 | `mise run image-prune [-- --images]` | Delete run directories (and goldens). |
 | `mise run test` | Host unit tests. |
 

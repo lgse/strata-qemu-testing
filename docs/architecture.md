@@ -59,9 +59,9 @@ nothing builds a golden implicitly.
 | --- | --- | --- |
 | `check-host` | `check-host` | Host capability check. Generates the SSH key on first success. |
 | `image-build` | `image-build [--force] <guest>` | Build or reuse a golden. Prints the golden path. |
-| `run-test` | `run-test <guest> (--session-only \| --install-from release \| --install-from local-archive PATH \| --omarchy-bindings \| --update-from VERSION) [--keep]` | Boot an overlay and run smokes. |
+| `run-test` | `run-test <guest> (--session-only \| --install-from release \| --install-from local-archive PATH \| --omarchy-bindings \| --update-from VERSION) [--apparmor-bwrap-restrict] [--keep]` | Boot an overlay and run smokes. |
 | `vm-run` | `vm-run [--graphical] [--keep] <guest>` | Interactive throwaway overlay. |
-| `vm-live` | `vm-live (--from-tag VERSION \| --from-local PATH) [--graphical] [--headless] [--keep] <guest>` | Interactive overlay with Strata installed and `~/fixtures` sample files. |
+| `vm-live` | `vm-live (--from-tag VERSION \| --from-local PATH) [--graphical] [--headless] [--apparmor-bwrap-restrict] [--keep] <guest>` | Interactive overlay with Strata installed and `~/fixtures` sample files. |
 | `image-prune` | `image-prune [--images]` | Delete run dirs; with `--images` also goldens. Never `keys/`. |
 | `test` | `python -m unittest discover -s tests -t .` | Host unit tests. |
 | `spike-wayland-ubuntu` (hidden) | `spike-wayland-ubuntu [--keep]` | Ad-hoc Noble session spike; predates the recipe system. |
@@ -313,6 +313,8 @@ Argument validation happens before anything touches the cache:
 - `--update-from` is exclusive with the other three. VERSION is a previous
   release tag (`0.15.0` or `v0.15.0`). The default previous-version list is
   `0.15.0,0.14.0`; override with `STRATA_QEMU_UPDATE_FROM`.
+- `--apparmor-bwrap-restrict` is a modifier for any flow and is accepted
+  only on `ubuntu-2404` (`APPARMOR_BWRAP_RESTRICT_GUESTS`).
 - `--install-from local-archive` requires an existing host path;
   `--install-from release` refuses a path.
 - `--omarchy-bindings` optionally uploads `STRATA_QEMU_INSTALL_SH`
@@ -342,6 +344,22 @@ Then:
    exit 1. Ctrl-C exits 130.
 
 ### Steps (`tests_spec.py`)
+
+**apparmor-bwrap-restrict** (`--apparmor-bwrap-restrict`, runs first,
+before the session step): upload `guest-tests/smoke-apparmor-bwrap.sh`.
+The script installs `apparmor-profiles` (`DEBIAN_FRONTEND=noninteractive`)
+when the extra profile is missing, copies
+`extra-profiles/bwrap-userns-restrict` into `/etc/apparmor.d`, and runs
+`apparmor_parser -r`. It then checks `apparmor_restrict_unprivileged_userns`,
+reads the loaded profiles from securityfs, and runs three sandboxes:
+`bwrap --unshare-all ... true` must pass, `cat /proc/self/attr/current`
+must report `unpriv_bwrap`, and `unshare -Urm true` must fail with
+`Operation not permitted`. This reproduces elementary OS 8 for
+lgse/strata#1926. The output goes to `apparmor-bwrap-restrict.txt`. The
+step records `restrict_unprivileged_userns`, `profiles`, `plain_bwrap_rc`,
+`child_label`, `nested_unshare_rc`, and `nested_unshare_error`. The
+profile attaches when bwrap is exec'd, so it must be loaded before Strata
+spawns its sandboxes. Budget 300 s.
 
 **session**: upload `guest-tests/smoke-session.sh` and run it with
 `SMOKE_COMPOSITOR=<gnome-shell|Hyprland>` every 2 s for up to 60 s. The
@@ -462,8 +480,13 @@ Same golden/overlay/host checks as `vm-run`. Exactly one of `--from-tag
 VERSION` or `--from-local PATH` is required. Graphical GTK/SDL is the
 default (`--headless` for SSH only). After SSH is up:
 
-1. Wait for the autologin Wayland session (`smoke-session.sh`).
-2. Install Strata:
+1. With `--apparmor-bwrap-restrict` (`ubuntu-2404` only), run the
+   `apparmor-bwrap-restrict` step described under run-test, and print the
+   nested `unshare` error.
+2. Wait for the autologin Wayland session (`smoke-session.sh`). On GNOME,
+   set `idle-delay 0`, `lock-enabled false`, and `idle-dim false`, then
+   `loginctl unlock-sessions`. A failure here is a warning, not fatal.
+3. Install Strata:
    - `--from-tag`: `smoke-update.sh` previous phase downloads the GitHub
      archive for that tag and installs the binary plus desktop entry.
    - `--from-local` tarball: upload the archive and run the same previous
@@ -471,14 +494,14 @@ default (`--headless` for SSH only). After SSH is up:
    - `--from-local` binary (or a checkout containing `strata` /
      `target/release/strata`): `scp` the binary and a generated desktop
      file into `~/.local`.
-3. Generate a sample tree on the host (`sample_tree.py`: documents, a
+4. Generate a sample tree on the host (`sample_tree.py`: documents, a
    1×1 PNG, a zip, nested dirs, a symlink, a hidden file, a name with
    spaces), upload it, and extract to `$HOME/fixtures`.
-4. If `pacman` is present and `gtk4` is not, install Strata's Arch
+5. If `pacman` is present and `gtk4` is not, install Strata's Arch
    runtime packages (`install.sh` `REQUIRED_PACKAGES`). Tagged/local
    installs copy a binary and skip `install.sh`; the arch golden has no
    GTK, while Omarchy and GNOME guests already do.
-5. Launch Strata on `$HOME/fixtures`. Hyprland 0.55+ (arch) uses
+6. Launch Strata on `$HOME/fixtures`. Hyprland 0.55+ (arch) uses
    `hyprctl dispatch 'hl.dsp.exec_cmd("…")'` — legacy
    `hyprctl dispatch exec PATH` is parsed as Lua and dies on `.local`.
    Falls back to `hl.exec_cmd` then `nohup`. GNOME uses `nohup`.
@@ -506,6 +529,9 @@ fixtures path, then waits for QEMU to exit. Run-dir lifetime matches
   (lgse/strata#743). Used only by `--omarchy-bindings`.
 - `guest-tests/smoke-omarchy-bindings.sh`: write (optional) and assert
   Hyprland file-manager bindings for major 3 vs 4.
+- `guest-tests/smoke-apparmor-bwrap.sh`: enforce `bwrap-userns-restrict`
+  and assert that nested user namespaces are denied inside bwrap. Used by
+  `--apparmor-bwrap-restrict`.
 - `guest-tests/smoke-desktop.sh`: combined bus-name/hyprctl + screenshot
   oracle. Exercised by unit tests; the live `run-test` path uses the
   host-driven equivalents in `tests_spec.py` instead.

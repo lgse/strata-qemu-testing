@@ -39,6 +39,11 @@ DEFAULT_FIRMWARE_SHARE_ROOTS: tuple[Path, ...] = (Path("/usr/share"),)
 
 # Generic floor when no guest is selected: 8 GiB guest + 1 GiB host slack.
 GENERIC_MEM_FLOOR_MIB = 9 * 1024
+APPARMOR_BWRAP_RESTRICT_HELP = (
+    "ubuntu-2404 only: enforce AppArmor's bwrap-userns-restrict profile "
+    "(as elementary OS 8 does) before Strata starts, and assert that nested "
+    "user namespaces inside bwrap are denied (lgse/strata#1926)"
+)
 
 # Named when qemu-system-x86_64 is missing. Not a generic "install qemu".
 QEMU_BOOTSTRAP_HINT = """\
@@ -325,6 +330,11 @@ def build_parser() -> argparse.ArgumentParser:
             "list with STRATA_QEMU_UPDATE_FROM (comma-separated)."
         ),
     )
+    run_test.add_argument(
+        "--apparmor-bwrap-restrict",
+        action="store_true",
+        help=APPARMOR_BWRAP_RESTRICT_HELP,
+    )
 
     vm_run = sub.add_parser(
         "vm-run",
@@ -378,6 +388,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--headless",
         action="store_true",
         help="No GTK/SDL window; SSH only",
+    )
+    vm_live.add_argument(
+        "--apparmor-bwrap-restrict",
+        action="store_true",
+        help=APPARMOR_BWRAP_RESTRICT_HELP,
     )
     vm_live.add_argument(
         "--keep",
@@ -520,6 +535,7 @@ def main(argv: list[str] | None = None) -> int:
             keep=args.keep,
             omarchy_bindings=args.omarchy_bindings,
             update_from=args.update_from,
+            apparmor_bwrap_restrict=args.apparmor_bwrap_restrict,
         )
 
     if args.command == "vm-run":
@@ -542,7 +558,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "usage: python -m strataqemu vm-live "
                 "(--from-tag VERSION | --from-local PATH) "
-                "[--graphical] [--headless] [--keep] <guest>",
+                "[--graphical] [--headless] [--apparmor-bwrap-restrict] "
+                "[--keep] <guest>",
                 file=sys.stderr,
             )
             return 2
@@ -553,6 +570,7 @@ def main(argv: list[str] | None = None) -> int:
             from_local=args.from_local,
             graphical=not args.headless,
             keep=args.keep,
+            apparmor_bwrap_restrict=args.apparmor_bwrap_restrict,
         )
 
     parser.error(f"unknown command {args.command!r}")

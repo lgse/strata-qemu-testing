@@ -112,6 +112,14 @@ INSTALL_FROM_RELEASE_GUESTS = frozenset(
         "omarchy-3",
     }
 )
+# Guests whose AppArmor can enforce bwrap-userns-restrict (lgse/strata#1926).
+APPARMOR_BWRAP_RESTRICT_GUESTS = frozenset({"ubuntu-2404"})
+APPARMOR_BWRAP_RESTRICT_STEP = "apparmor-bwrap-restrict"
+APPARMOR_BWRAP_RESTRICT_LOG = "apparmor-bwrap-restrict.txt"
+APPARMOR_BWRAP_RESTRICT_TIMEOUT_S = 300
+APPARMOR_BWRAP_RESTRICT_UNSUPPORTED = (
+    "--apparmor-bwrap-restrict is only supported on ubuntu-2404"
+)
 VERSION_CLI_RE = re.compile(r"^(strata\s+)?v?\d+\.\d+", re.IGNORECASE)
 INSTALL_FROM_FAIL_CLOSED = (
     "run-test: --install-from is not supported for this guest; "
@@ -234,6 +242,15 @@ def smoke_omarchy_detect_script() -> Path:
 
 def smoke_omarchy_bindings_script() -> Path:
     return guest_tests_dir() / "smoke-omarchy-bindings.sh"
+
+
+def smoke_apparmor_bwrap_script() -> Path:
+    return guest_tests_dir() / "smoke-apparmor-bwrap.sh"
+
+
+def supports_apparmor_bwrap_restrict(guest: Guest | str) -> bool:
+    guest_id = guest.id if isinstance(guest, Guest) else guest
+    return guest_id in APPARMOR_BWRAP_RESTRICT_GUESTS
 
 
 def omarchy_install_major(guest: Guest | str) -> int | None:
@@ -1312,6 +1329,55 @@ def assert_session_only_commands(commands: Sequence[str]) -> None:
             raise SessionSmokeError(
                 f"--session-only invoked a forbidden command: {command}"
             )
+
+
+def run_apparmor_bwrap_restrict_step(
+    machine: Machine,
+    *,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+) -> dict:
+    """Enforce ``bwrap-userns-restrict`` and assert nested userns is denied.
+
+    Must run before Strata starts: AppArmor attaches the profile when bwrap
+    is exec'd, so sandboxes spawned earlier stay unconfined. The guest
+    script's output is saved to ``apparmor-bwrap-restrict.txt``.
+    """
+    script = smoke_apparmor_bwrap_script()
+    if not script.is_file():
+        raise SessionSmokeError(f"missing AppArmor smoke script {script}")
+    started = time.monotonic()
+    scp_to_guest(
+        machine, script, "/tmp/smoke-apparmor-bwrap.sh", run=run, commands=commands
+    )
+    proc = ssh_run(
+        machine,
+        "bash /tmp/smoke-apparmor-bwrap.sh",
+        timeout=APPARMOR_BWRAP_RESTRICT_TIMEOUT_S,
+        run=run,
+        commands=commands,
+    )
+    record = machine.artifacts.root / APPARMOR_BWRAP_RESTRICT_LOG
+    record.write_text(f"{proc.stdout}{proc.stderr}", encoding="utf-8")
+    if proc.returncode != 0:
+        raise SessionSmokeError(
+            f"{APPARMOR_BWRAP_RESTRICT_STEP}: restriction not in effect "
+            f"(exit {proc.returncode}): {(proc.stderr or proc.stdout).strip()}"
+        )
+    return {
+        "name": APPARMOR_BWRAP_RESTRICT_STEP,
+        "status": "pass",
+        "seconds": round(time.monotonic() - started, 1),
+        "restrict_unprivileged_userns": parse_smoke_kv(
+            proc.stdout, "RESTRICT_UNPRIVILEGED_USERNS"
+        ),
+        "profiles": parse_smoke_kv(proc.stdout, "PROFILES"),
+        "plain_bwrap_rc": parse_smoke_kv(proc.stdout, "PLAIN_BWRAP_RC"),
+        "child_label": parse_smoke_kv(proc.stdout, "CHILD_LABEL"),
+        "nested_unshare_rc": parse_smoke_kv(proc.stdout, "NESTED_UNSHARE_RC"),
+        "nested_unshare_error": parse_smoke_kv(proc.stdout, "NESTED_UNSHARE_ERR"),
+        "log": str(record),
+    }
 
 
 def wait_hyprland_class(
